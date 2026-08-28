@@ -1,0 +1,12 @@
+# galvanize-dsh bundle layer: mounts the trigger-management tools plugin.
+# A patch replaces a row's whole `config` (no deep merge), so this row is
+# authored complete. Row id is addressed by `dsh --dump-config` greps and by
+# user overlays.
+- insert:
+    - id: galvanize/tools
+      name: galvanize-dsh
+      config:
+        # Headless profile the core's shell-wake spawns per event:
+        #   dsh --profile <wakeProfile> "<prompt>"
+        # Restate this key in a profile patch to route wakes elsewhere.
+        wakeProfile: headless

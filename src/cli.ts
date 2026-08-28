@@ -1,0 +1,443 @@
+/**
+ * galvanize-dsh installer / verifier.
+ *
+ * install   — mount the bundle into a DSH profile and PROVE it loaded
+ * verify    — the three-part LOADED check (patch row, heartbeat, handshake)
+ * uninstall — remove the bundle row + surface entry
+ *
+ * The heartbeat-based verification is the product here (PLAN §3): DSH
+ * PENDING fibers fail silently, so an installer that only writes config can
+ * never claim success. We never print "should be fine".
+ *
+ * @module galvanize-dsh/cli
+ */
+import { spawnSync } from 'node:child_process'
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+import process from 'node:process'
+import { fileURLToPath } from 'node:url'
+
+import { fetchVersion, handshake, heartbeatPath, readServeInfo, surfacesPath, versionOk } from './core-client.js'
+import { PLUGIN_VERSION, readHeartbeat } from './heartbeat.js'
+
+const ROW_ID = 'galvanize/tools'
+const PKG = 'galvanize-dsh'
+
+/**
+ * What to hand `dsh plugin add`: an npm spec by default; a git checkout (or
+ * tarball) auto-detected when this CLI runs from one, so `node lib/cli.js
+ * install` works before the package is published. --source overrides.
+ */
+function resolvePkgSpec(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url))
+    // lib/cli.js -> package root
+    const root = join(here, '..')
+    if (existsSync(join(root, 'src', 'index.ts')) && existsSync(join(root, 'cordis.patch.yml'))) {
+      return root.split('\\').join('/')
+    }
+  } catch {
+    /* fall through to the npm name */
+  }
+  return PKG
+}
+
+/** Wake profile resolved from --wake-profile (default: headless). */
+let WAKE_PROFILE = 'headless'
+function cfgWakeProfile(): string {
+  return WAKE_PROFILE
+}
+
+// ---------------------------------------------------------------- dsh probe
+
+interface DshBin {
+  cmd: string
+  args: string[]
+  note: string
+  /** Windows .cmd shims (npm bin on PATH) cannot be spawned without a shell. */
+  shell?: boolean
+}
+
+/** Locate the dsh CLI: $DSH_BIN, PATH, then the npx cache on this box. */
+function findDsh(): DshBin | null {
+  const envBin = (process.env['DSH_BIN'] ?? '').trim()
+  if (envBin && existsSync(envBin)) return { cmd: process.execPath, args: [envBin], note: `$DSH_BIN=${envBin}` }
+  const probe = spawnSync('dsh', ['--version'], { shell: process.platform === 'win32', timeout: 15_000, encoding: 'utf8' })
+  if (probe.status === 0) return { cmd: 'dsh', args: [], note: 'dsh on PATH', shell: process.platform === 'win32' }
+  // npx cache fallback (how DSH is often launched: npx @deepseek-ai/dsh) —
+  // npm's cache dir differs per OS.
+  const cacheRoots = [
+    join(homedir(), 'AppData', 'Local', 'npm-cache', '_npx'), // Windows
+    join(homedir(), '.npm', '_npx'), // Linux
+    join(homedir(), 'Library', 'Caches', 'npm-cache', '_npx'), // macOS
+    join(homedir(), '.cache', 'npx'),
+  ]
+  for (const root of cacheRoots) {
+    if (!existsSync(root)) continue
+    try {
+      for (const dir of readdirSync(root)) {
+        const bin = join(root, dir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+        if (existsSync(bin)) return { cmd: process.execPath, args: [bin], note: `npx cache: ${bin}` }
+      }
+    } catch {
+      /* keep looking */
+    }
+  }
+  return null
+}
+
+function runDsh(dsh: DshBin, argv: string[], timeoutMs = 120_000): { code: number; out: string } {
+  const r = spawnSync(dsh.cmd, [...dsh.args, ...argv], {
+    encoding: 'utf8',
+    timeout: timeoutMs,
+    shell: dsh.shell === true,
+    maxBuffer: 8 * 1024 * 1024,
+  })
+  return { code: r.status ?? -1, out: `${r.stdout ?? ''}${r.stderr ?? ''}` }
+}
+
+function dshHome(): string {
+  const env = (process.env['DSH_HOME'] ?? '').trim()
+  if (env) return env
+  return join(homedir(), '.dsh')
+}
+
+// ---------------------------------------------------------------- verify
+
+interface Check {
+  name: string
+  ok: boolean
+  detail: string
+}
+
+async function checkHandshake(): Promise<Check> {
+  const info = readServeInfo()
+  if (!info) {
+    return { name: 'core /version handshake', ok: false, detail: 'no ~/.galvanize/serve.json — start the core: `galvanize run` (install: `uvx galvanize init`)' }
+  }
+  const v = await fetchVersion(info.port)
+  if (!v) return { name: 'core /version handshake', ok: false, detail: `serve.json says port ${info.port} but nothing answered — restart the core` }
+  if (!versionOk(v)) {
+    return { name: 'core /version handshake', ok: false, detail: `core ${v.core_version} api_version ${v.api_version} outside plugin compat` }
+  }
+  return { name: 'core /version handshake', ok: true, detail: `core ${v.core_version}, api ${v.api_version}` }
+}
+
+function checkPatchRow(dsh: DshBin | null, profile: string): Check {
+  if (!dsh) return { name: `patch row '${ROW_ID}' in profile ${profile}`, ok: false, detail: 'dsh CLI not found (set DSH_BIN or install @deepseek-ai/dsh)' }
+  const { code, out } = runDsh(dsh, ['--profile', profile, '--dump-config'], 60_000)
+  if (code !== 0) return { name: `patch row '${ROW_ID}' in profile ${profile}`, ok: false, detail: `dsh --dump-config failed (exit ${code}): ${out.slice(-300)}` }
+  const has = new RegExp(`id: ${ROW_ID.replace('/', '\\/')}`).test(out)
+  const installed = out.includes(PKG)
+  return {
+    name: `patch row '${ROW_ID}' in profile ${profile}`,
+    ok: has && installed,
+    detail: has ? (installed ? 'row present, package resolvable' : `row present but '${PKG}' not found in composed tree`) : 'row missing — run: galvanize-dsh install',
+  }
+}
+
+function checkHeartbeat(): Check {
+  const beat = readHeartbeat()
+  if (!beat) {
+    return {
+      name: 'plugin heartbeat (~/.galvanize/dsh-heartbeat.json)',
+      ok: false,
+      detail:
+        'no fresh heartbeat — the plugin fiber is not ACTIVE. Boot DSH with the profile (`dsh --profile <p>` or a one-shot) and re-run verify; a PENDING fiber never writes this file.',
+    }
+  }
+  const ageS = Math.round((Date.now() - beat.ts) / 1000)
+  return {
+    name: 'plugin heartbeat (~/.galvanize/dsh-heartbeat.json)',
+    ok: true,
+    detail: `plugin ${beat.plugin_version}, core_api_ok=${beat.core_api_ok}, ${ageS}s ago (pid ${beat.pid})`,
+  }
+}
+
+async function cmdVerify(profile: string, dsh: DshBin | null): Promise<number> {
+  const checks = [await checkHandshake(), checkPatchRow(dsh, profile), checkHeartbeat()]
+  console.log(`galvanize-dsh v${PLUGIN_VERSION} — verify (profile: ${profile})`)
+  for (const c of checks) console.log(`  ${c.ok ? '✔' : '✘'} ${c.name}\n      ${c.detail}`)
+  const ok = checks.every((c) => c.ok)
+  console.log(ok ? '\nLOADED: all three checks green.' : '\nNOT LOADED: fix the ✘ items above — do not trust the tools until this passes.')
+  return ok ? 0 : 1
+}
+
+
+// ------------------------------------------------------------- package add
+
+/** Read profile package.json (null when absent/unparsable). */
+function readProfilePkg(profile: string): any | null {
+  try {
+    return JSON.parse(readFileSync(join(dshHome(), 'profiles', profile, 'package.json'), 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+function depNames(pkg: any): string[] {
+  return Object.keys(pkg?.dependencies ?? {})
+}
+
+/**
+ * Add package specs to a profile: `dsh plugin add` first (the blessed path;
+ * it also reconciles dsh.profile.bundles). On failure — e.g. a network stack
+ * that kills pnpm's parallel fetches — fall back to npm install in the
+ * profile dir and reconcile the bundles list ourselves. Both layouts are
+ * plain hoisted node_modules, which is all Cordis resolution needs.
+ */
+function addPkgsToProfile(dsh: DshBin, profile: string, specs: string[]): { ok: boolean; via: string; out: string } {
+  console.log(`> dsh plugin --profile ${profile} add ${specs.join(' ')}`)
+  const before = depNames(readProfilePkg(profile))
+  const r = runDsh(dsh, ['plugin', '--profile', profile, 'add', ...specs], 300_000)
+  if (r.code === 0) return { ok: true, via: 'dsh plugin (pnpm)', out: r.out }
+  console.log(`  dsh plugin add failed (exit ${r.code}) — falling back to npm install in the profile dir`)
+
+  const verProbe = runDsh(dsh, ['--version'], 30_000).out.trim()
+  const ver = /(\d+\.\d+\.\d+[^\s]*)/.exec(verProbe)?.[1] ?? ''
+  const npmSpecs = specs.map((sp) =>
+    /^@deepseek-ai\/[a-z0-9-]+$/.test(sp) && ver ? `${sp}@${ver}` : sp)
+
+  const npm = spawnSync('npm', ['install', '--no-audit', '--no-fund', '--save-exact', ...npmSpecs], {
+    cwd: join(dshHome(), 'profiles', profile),
+    shell: process.platform === 'win32',
+    timeout: 600_000,
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024,
+  })
+  if ((npm.status ?? -1) !== 0) {
+    return { ok: false, via: 'npm fallback', out: `${r.out.slice(-400)}
+--- npm fallback ---
+${(npm.stdout ?? '') + (npm.stderr ?? '')}`.slice(-1600) }
+  }
+  // Reconcile dsh.profile.bundles: every newly added dependency becomes a
+  // bundle row (same rule `dsh plugin add` applies).
+  const pkgPath = join(dshHome(), 'profiles', profile, 'package.json')
+  try {
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
+    const after = depNames(pkg)
+    const added = after.filter((n) => !before.includes(n))
+    const bundles: string[] = pkg?.dsh?.profile?.bundles ?? []
+    const merged = [...new Set([...bundles, ...added])]
+    pkg.dsh = { ...(pkg.dsh ?? {}), profile: { ...(pkg.dsh?.profile ?? {}), bundles: merged } }
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n')
+    console.log(`  npm fallback ok — bundles now: ${merged.join(', ') || '(none)'}`)
+  } catch {
+    /* package.json shape unexpected; the installed deps still resolve */
+  }
+  return { ok: true, via: 'npm fallback', out: (npm.stdout ?? '').slice(-400) }
+}
+
+// ---------------------------------------------------------------- install
+
+async function cmdInstall(profile: string, dsh: DshBin | null, pkgSpec: string): Promise<number> {
+  const hs = await handshake()
+  if (!hs.info) {
+    console.error(`galvanize core unreachable: ${hs.incompatible}`)
+    console.error('Install/start the core first, then re-run: `uvx galvanize init`')
+    return 1
+  }
+  console.log(`core reachable (${hs.info.core_version}, api ${hs.info.api_version})`)
+  if (!dsh) {
+    console.error('dsh CLI not found. Fix either way, then re-run install:')
+    console.error('  npm install -g @deepseek-ai/dsh          # any OS')
+    console.error('  DSH_BIN=<path-to>/dsh/lib/bin.js        # or point at an existing checkout')
+    console.error('Meanwhile a DSH wake works with no plugin at all: galvanize add <source> ... --wake shell --command "dsh --profile headless \\"{prompt}\\""')
+    return 1
+  }
+  console.log(`using ${dsh.note}`)
+
+  // Target profile: add our bundle row (dsh plugin add reconciles
+  // dsh.profile.bundles automatically). Fresh profiles get base + the app
+  // bundle too, or there is nothing to boot.
+  const pkgJson = join(dshHome(), 'profiles', profile, 'package.json')
+  let needBundles = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
+  let fresh = true
+  if (existsSync(pkgJson)) {
+    try {
+      const parsed = JSON.parse(readFileSync(pkgJson, 'utf8')) as { dsh?: { profile?: { bundles?: string[] } } }
+      if ((parsed?.dsh?.profile?.bundles?.length ?? 0) > 0) {
+        needBundles = []
+        fresh = false
+      }
+    } catch {
+      /* fall through: dsh plugin add reconciles anyway */
+    }
+  }
+  const add = addPkgsToProfile(dsh, profile, [...needBundles, pkgSpec])
+  if (!add.ok) {
+    console.error(add.out)
+    console.error(`install failed while adding bundles to profile '${profile}'`)
+    return 1
+  }
+  console.log(`  via ${add.via}`)
+  if (fresh) {
+    console.log(`profile '${profile}' was empty — created it with base + web app bundles.`)
+    console.log('LLM provider/model still come from $DSH_HOME/settings.yaml.')
+  }
+
+  // Wake profile bootstrap: the core spawns `dsh --profile <wakeProfile>
+  // "<prompt>"` per event; a fresh profile needs base + the headless app.
+  const wakePkg = join(dshHome(), 'profiles', cfgWakeProfile(), 'package.json')
+  let wakeBundles: string[] = []
+  if (existsSync(wakePkg)) {
+    try {
+      const parsed = JSON.parse(readFileSync(wakePkg, 'utf8')) as { dsh?: { profile?: { bundles?: string[] } } }
+      wakeBundles = parsed?.dsh?.profile?.bundles ?? []
+    } catch {
+      /* bootstrap below */
+    }
+  }
+  if (!wakeBundles.includes('@deepseek-ai/dsh-headless')) {
+    const wp = cfgWakeProfile()
+    console.log(`wake profile '${wp}' missing the headless app — bootstrapping it`)
+    const addW = addPkgsToProfile(dsh, wp, ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'])
+    if (!addW.ok) {
+      console.error(addW.out)
+      console.error(`wake-profile bootstrap failed for '${wp}'`)
+      return 1
+    }
+  }
+  // Also mount the tools into the wake profile: a session woken by an event
+  // can then manage its own triggers, and (the real reason) the installer can
+  // prove LOADED autonomously via a headless boot probe below.
+  if (!wakeBundles.includes(PKG)) {
+    const addW2 = addPkgsToProfile(dsh, cfgWakeProfile(), [pkgSpec])
+    if (!addW2.ok) {
+      console.error(addW2.out)
+      console.error(`wake-profile plugin add failed`)
+      return 1
+    }
+  }
+
+  // Surface registry (exactly-one-surface rule): even before first boot,
+  // record that DSH should get the plugin, not the MCP tools.
+  try {
+    const { writeFileSync } = await import('node:fs')
+    let existing: Record<string, string> = {}
+    try {
+      existing = JSON.parse(readFileSync(surfacesPath(), 'utf8'))
+    } catch {
+      /* new file */
+    }
+    writeFileSync(surfacesPath(), JSON.stringify({ ...existing, dsh: 'plugin' }, null, 2))
+  } catch {
+    /* doctor still detects the row */
+  }
+
+  console.log('\nInstalled. Running a headless boot probe to prove the plugin loads…')
+  const probe = await bootProbe(dsh, cfgWakeProfile())
+  if (!probe.ok) {
+    console.error(`probe: ${probe.detail}`)
+  }
+  return cmdVerify(profile, dsh)
+}
+
+/**
+ * Boot-probe: remove any stale heartbeat, run one trivial headless task in
+ * the wake profile (apply() → ACTIVE → heartbeat write), wait for the file.
+ * This makes `install` self-proving instead of trusting a manual boot.
+ */
+async function bootProbe(
+  dsh: DshBin,
+  wakeProfile: string,
+): Promise<{ ok: boolean; detail: string }> {
+  try {
+    const { rmSync } = await import('node:fs')
+    rmSync(heartbeatPath(), { force: true })
+  } catch {
+    /* stale file removal is best-effort; freshness is ts-gated anyway */
+  }
+  const since = Date.now() - 2_000
+  const boot = runDsh(dsh, ['--profile', wakeProfile, 'Reply with exactly: GALVANIZE_PROBE'], 300_000)
+  // The heartbeat is the proof; the boot's exit code only explains a miss.
+  // (An unconfigured LLM provider fails the *task* after fibers activate —
+  // the plugin still proved itself.)
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    const beat = readHeartbeat(120_000)
+    // Require THIS plugin version's heartbeat: a previously-booted DSH
+    // session refreshing the file every 30s must not count as proof.
+    if (beat && beat.ts >= since && beat.plugin_version === PLUGIN_VERSION) {
+      return { ok: true, detail: `heartbeat fresh (plugin ${beat.plugin_version}, core_api_ok=${beat.core_api_ok})` }
+    }
+    await new Promise((r) => setTimeout(r, 1_000))
+  }
+  return {
+    ok: false,
+    detail:
+      boot.code !== 0
+        ? `headless boot failed (exit ${boot.code}) and no heartbeat appeared: ${boot.out.slice(-300)}`
+        : 'headless boot succeeded but no heartbeat appeared — the plugin fiber may be PENDING (check the patch row) or the boot skipped plugin load.',
+  }
+}
+
+async function cmdUninstall(profile: string, dsh: DshBin | null): Promise<number> {
+  let code = 0
+  if (dsh) {
+    const targets = profile === cfgWakeProfile() ? [profile] : [profile, cfgWakeProfile()]
+    for (const p of targets) {
+      const r = runDsh(dsh, ['plugin', '--profile', p, 'remove', PKG], 300_000)
+      console.log(r.out.slice(-600))
+      if (r.code !== 0) code = r.code
+    }
+  } else {
+    console.error('dsh CLI not found — remove manually: `dsh plugin --profile ' + profile + ' remove ' + PKG + '`')
+    code = 1
+  }
+  try {
+    const { writeFileSync } = await import('node:fs')
+    let existing: Record<string, string> = {}
+    try {
+      existing = JSON.parse(readFileSync(surfacesPath(), 'utf8'))
+    } catch {
+      /* nothing to clean */
+    }
+    delete existing['dsh']
+    writeFileSync(surfacesPath(), JSON.stringify(existing, null, 2))
+    console.log('surface registry updated (dsh → unset; core init may re-register MCP).')
+  } catch {
+    /* ignore */
+  }
+  return code
+}
+
+// ---------------------------------------------------------------- main
+
+async function main(): Promise<number> {
+  const argv = process.argv.slice(2)
+  const cmd = argv[0] ?? 'help'
+  const profileIdx = argv.indexOf('--profile')
+  const profile = profileIdx >= 0 ? (argv[profileIdx + 1] ?? 'web') : 'web'
+  const wakeIdx = argv.indexOf('--wake-profile')
+  if (wakeIdx >= 0 && argv[wakeIdx + 1]) WAKE_PROFILE = argv[wakeIdx + 1]
+  const srcIdx = argv.indexOf('--source')
+  const pkgSpec = srcIdx >= 0 && argv[srcIdx + 1] ? argv[srcIdx + 1] : resolvePkgSpec()
+  const dsh = findDsh()
+
+  switch (cmd) {
+    case 'install':
+      return cmdInstall(profile, dsh, pkgSpec)
+    case 'verify':
+      return cmdVerify(profile, dsh)
+    case 'uninstall':
+      return cmdUninstall(profile, dsh)
+    default:
+      console.log(`galvanize-dsh v${PLUGIN_VERSION}
+
+Usage:
+  galvanize-dsh install   [--profile <p>] [--wake-profile <wp>] [--source <spec>]  mount the bundle into a DSH profile (default: web), bootstrap the wake profile (default: headless), boot-probe, then verify
+                          --source: npm name | path | tarball (default: this checkout when run from one, else the npm name)
+  galvanize-dsh verify    [--profile <p>]                        LOADED check: patch row ∧ fresh heartbeat ∧ /version handshake
+  galvanize-dsh uninstall [--profile <p>]                        remove the bundle + surface registry entry
+
+The verify step is not a formality: DSH loads a broken plugin as a silent
+PENDING fiber. Only these three green checks mean the trigger_* tools exist.`)
+      return cmd === 'help' ? 0 : 2
+  }
+}
+
+main().then((code) => {
+  process.exitCode = code
+})
