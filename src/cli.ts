@@ -405,7 +405,44 @@ async function cmdUninstall(profile: string, dsh: DshBin | null): Promise<number
 
 // ---------------------------------------------------------------- main
 
+/** Enforce package.json engines (^22.19 || >=24) with a clear message. */
+function nodeOk(): boolean {
+  const m = /v(\d+)\.(\d+)/.exec(process.versions.node)
+  if (!m) return true
+  const major = Number(m[1])
+  const minor = Number(m[2])
+  return (major === 22 && minor >= 19) || major >= 24 || (major > 22 && major < 24 && process.env.GALVANIZE_DSH_UNSAFE_NODE === '1')
+}
+
+/**
+ * Offer to install the dsh CLI when it's missing (TTY only — non-interactive
+ * contexts keep the guidance message). npm -g is the blessed path on all OS.
+ */
+async function maybeInstallDsh(): Promise<DshBin | null> {
+  if (!process.stdin.isTTY) return null
+  const { createInterface } = await import('node:readline/promises')
+  const rl = createInterface({ input: process.stdin, output: process.stdout })
+  const answer = await rl.question('Install @deepseek-ai/dsh globally via npm now? [Y/n] ')
+  rl.close()
+  if (/^\s*[nN]/.test(answer)) return null
+  console.log('> npm install -g @deepseek-ai/dsh')
+  const r = spawnSync('npm', ['install', '-g', '@deepseek-ai/dsh', '--no-audit', '--no-fund'], {
+    stdio: 'inherit',
+    shell: process.platform === 'win32',
+    timeout: 600_000,
+  })
+  if ((r.status ?? -1) !== 0) {
+    console.error('npm global install failed — on Linux use a user-owned npm prefix (nvm) rather than sudo, then re-run install.')
+    return null
+  }
+  return findDsh()
+}
+
 async function main(): Promise<number> {
+  if (!nodeOk()) {
+    console.error(`Node ${process.versions.node} is unsupported: galvanize-dsh requires ^22.19 || >=24 (DSH's range). Install one, e.g.: nvm install 22`)
+    return 1
+  }
   const argv = process.argv.slice(2)
   const cmd = argv[0] ?? 'help'
   const profileIdx = argv.indexOf('--profile')
@@ -414,10 +451,11 @@ async function main(): Promise<number> {
   if (wakeIdx >= 0 && argv[wakeIdx + 1]) WAKE_PROFILE = argv[wakeIdx + 1]
   const srcIdx = argv.indexOf('--source')
   const pkgSpec = srcIdx >= 0 && argv[srcIdx + 1] ? argv[srcIdx + 1] : resolvePkgSpec()
-  const dsh = findDsh()
+  let dsh = findDsh()
 
   switch (cmd) {
     case 'install':
+      if (!dsh && process.stdin.isTTY) dsh = await maybeInstallDsh()
       return cmdInstall(profile, dsh, pkgSpec)
     case 'verify':
       return cmdVerify(profile, dsh)
