@@ -1,0 +1,33 @@
+name: publish
+
+# Trusted publishing via npm OIDC (no stored token, provenance attested).
+# One-time setup on npmjs.com: package page → Publishing → Trusted publisher:
+#   Workflow: publish.yml  (this file)
+#   Repository owner: jarvis959
+#   Repository name: galvanize-dsh
+# After that, every version bump pushed as a `v*` tag publishes automatically.
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC for npm provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npx vitest run
+      - run: npx publint
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: '' # presence of an empty token forces the OIDC path
