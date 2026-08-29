@@ -1,6 +1,6 @@
 {
   "name": "galvanize-dsh",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Native DSH (DeepSeek Harness) bundle for galvanize event triggers: trigger_add/list/remove/test/status in the agent's tool schema, thin client over the core's versioned local API.",
   "type": "module",
   "license": "MIT",

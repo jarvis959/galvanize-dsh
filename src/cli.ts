@@ -12,30 +12,47 @@
  * @module galvanize-dsh/cli
  */
 import { spawnSync } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { sep as SEP, dirname, join } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
-import { fetchVersion, handshake, heartbeatPath, readServeInfo, surfacesPath, versionOk } from './core-client.js'
+import { fetchVersion, galvanizeHome, handshake, heartbeatPath, readServeInfo, surfacesPath, versionOk } from './core-client.js'
 import { PLUGIN_VERSION, readHeartbeat } from './heartbeat.js'
 
 const ROW_ID = 'galvanize/tools'
 const PKG = 'galvanize-dsh'
 
 /**
- * What to hand `dsh plugin add`: an npm spec by default; a git checkout (or
- * tarball) auto-detected when this CLI runs from one, so `node lib/cli.js
- * install` works before the package is published. --source overrides.
+ * What to hand `dsh plugin add`. Priority:
+ *  1. explicit --source
+ *  2. the package the CLI itself runs from, whenever that's a directory we
+ *     can install from (dev checkout *or* the npx cache — `npx github:…`
+ *     runs from a cache dir whose published file list is exactly what a
+ *     profile needs: lib/ + cordis.patch.yml + package.json)
+ *  3. the npm name (only meaningful once published)
+ * A profile's node_modules layout is identical either way; dsh's loader
+ * resolves packages by walking node_modules upward from the profile, so an
+ * absolute install spec works (verified: dsh plugin add accepts abs paths).
  */
 function resolvePkgSpec(): string {
   try {
     const here = dirname(fileURLToPath(import.meta.url))
-    // lib/cli.js -> package root
     const root = join(here, '..')
-    if (existsSync(join(root, 'src', 'index.ts')) && existsSync(join(root, 'cordis.patch.yml'))) {
-      return root.split('\\').join('/')
+    if (existsSync(join(root, 'cordis.patch.yml')) && existsSync(join(root, 'package.json'))) {
+      // npx-cache dirs are garbage-collected by npm; a profile must not
+      // depend on one. Stage a stable copy under ~/.galvanize instead.
+      if (root.includes('_npx') || root.includes(`${SEP}npm-cache${SEP}`)) {
+        const dest = join(galvanizeHome(), 'dsh-bundle')
+        rmSync(dest, { recursive: true, force: true }) // stale-file-free refresh
+        cpSync(root, dest, {
+          recursive: true,
+          filter: (src) => !src.split(SEP).includes('node_modules'),
+        })
+        return dest.split(SEP).join('/')
+      }
+      return root.split(SEP).join('/')
     }
   } catch {
     /* fall through to the npm name */
