@@ -14,7 +14,7 @@
 import { spawnSync } from 'node:child_process'
 import { cpSync, existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { sep as SEP, dirname, join } from 'node:path'
+import { sep as SEP, dirname, join, relative } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
@@ -48,7 +48,10 @@ function resolvePkgSpec(): string {
         rmSync(dest, { recursive: true, force: true }) // stale-file-free refresh
         cpSync(root, dest, {
           recursive: true,
-          filter: (src) => !src.split(SEP).includes('node_modules'),
+          // exclude the package's OWN node_modules — test the path relative
+          // to root; in the npx cache every absolute path contains a
+          // node_modules ancestor, which used to exclude everything.
+          filter: (src) => !relative(root, src).split(SEP).includes('node_modules'),
         })
         return dest.split(SEP).join('/')
       }
