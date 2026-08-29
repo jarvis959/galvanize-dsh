@@ -53,6 +53,20 @@ function resolvePkgSpec(): string {
           // node_modules ancestor, which used to exclude everything.
           filter: (src) => !relative(root, src).split(SEP).includes('node_modules'),
         })
+        // A staged copy is a built ARTIFACT: drop build lifecycle scripts so
+        // `npm install <dir>` (which runs a directory package's `prepare`)
+        // never tries to rebuild it with devDeps that aren't there.
+        try {
+          const pj = join(dest, 'package.json')
+          const pkg = JSON.parse(readFileSync(pj, 'utf8'))
+          if (pkg.scripts) {
+            delete pkg.scripts.prepare
+            delete pkg.scripts.prepack
+            writeFileSync(pj, JSON.stringify(pkg, null, 2) + '\n')
+          }
+        } catch {
+          /* staged package.json unreadable — nothing better to do here */
+        }
         return dest.split(SEP).join('/')
       }
       return root.split(SEP).join('/')
