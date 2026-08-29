@@ -41,40 +41,63 @@ function resolvePkgSpec(): string {
     const here = dirname(fileURLToPath(import.meta.url))
     const root = join(here, '..')
     if (existsSync(join(root, 'cordis.patch.yml')) && existsSync(join(root, 'package.json'))) {
-      // npx-cache dirs are garbage-collected by npm; a profile must not
-      // depend on one. Stage a stable copy under ~/.galvanize instead.
-      if (root.includes('_npx') || root.includes(`${SEP}npm-cache${SEP}`)) {
-        const dest = join(galvanizeHome(), 'dsh-bundle')
-        rmSync(dest, { recursive: true, force: true }) // stale-file-free refresh
-        cpSync(root, dest, {
-          recursive: true,
-          // exclude the package's OWN node_modules — test the path relative
-          // to root; in the npx cache every absolute path contains a
-          // node_modules ancestor, which used to exclude everything.
-          filter: (src) => !relative(root, src).split(SEP).includes('node_modules'),
-        })
-        // A staged copy is a built ARTIFACT: drop build lifecycle scripts so
-        // `npm install <dir>` (which runs a directory package's `prepare`)
-        // never tries to rebuild it with devDeps that aren't there.
-        try {
-          const pj = join(dest, 'package.json')
-          const pkg = JSON.parse(readFileSync(pj, 'utf8'))
-          if (pkg.scripts) {
-            delete pkg.scripts.prepare
-            delete pkg.scripts.prepack
-            writeFileSync(pj, JSON.stringify(pkg, null, 2) + '\n')
-          }
-        } catch {
-          /* staged package.json unreadable — nothing better to do here */
-        }
-        return dest.split(SEP).join('/')
-      }
-      return root.split(SEP).join('/')
+      // Directory sources (dev checkout, npx cache) are packed to a tgz:
+      // `npm install <dir>` records a SYMLINK and Node ESM resolves through
+      // the realpath — a bundle living outside the profile tree can't see
+      // @deepseek-ai/* peers there (ERR_MODULE_NOT_FOUND at plugin load).
+      // A tarball installs like the published package does: real files,
+      // resolvable peers, garbage-collect-safe (npx cache dirs are not).
+      const tgz = packToTgz(root)
+      if (tgz) return tgz.split(SEP).join('/')
+      return root.split(SEP).join('/') // packing failed; last resort
     }
   } catch {
     /* fall through to the npm name */
   }
   return PKG
+}
+
+/**
+ * Pack a directory package into a tgz under ~/.galvanize and return its
+ * path. Packs a CLEANED COPY: npm pack runs lifecycle scripts (prepare =
+ * full rebuild, impossible in an npx cache without devDeps; --ignore-scripts
+ * was not honored), and the staged copy is a built artifact — we ship lib/
+ * as-is.
+ */
+function packToTgz(root: string): string | null {
+  try {
+    const workDir = join(galvanizeHome(), 'pack-tmp')
+    rmSync(workDir, { recursive: true, force: true })
+    const src = join(workDir, 'pkg')
+    cpSync(root, src, {
+      recursive: true,
+      // exclude the package's OWN node_modules — test the path relative
+      // to root; in the npx cache every absolute path contains a
+      // node_modules ancestor, which used to exclude everything.
+      filter: (s) => !relative(root, s).split(SEP).includes('node_modules'),
+    })
+    const pj = join(src, 'package.json')
+    const pkg = JSON.parse(readFileSync(pj, 'utf8')) as { scripts?: Record<string, string> }
+    if (pkg.scripts) {
+      delete pkg.scripts.prepare
+      delete pkg.scripts.prepack
+      delete pkg.scripts.postinstall
+      writeFileSync(pj, JSON.stringify(pkg, null, 2) + '\n')
+    }
+    const outDir = galvanizeHome()
+    const r = spawnSync('npm', ['pack', '--pack-destination', outDir, src], {
+      encoding: 'utf8',
+      shell: process.platform === 'win32',
+      timeout: 120_000,
+    })
+    rmSync(workDir, { recursive: true, force: true })
+    if (r.status !== 0) return null
+    const name = r.stdout.trim().split('\n').filter(Boolean).pop()
+    const p = name ? join(outDir, name) : null
+    return p && existsSync(p) ? p : null
+  } catch {
+    return null
+  }
 }
 
 /** Wake profile resolved from --wake-profile (default: headless). */
@@ -363,8 +386,13 @@ async function cmdInstall(profile: string, dsh: DshBin | null, pkgSpec: string):
   console.log('\nInstalled. Running a headless boot probe to prove the plugin loads…')
   const probe = await bootProbe(dsh, cfgWakeProfile())
   if (!probe.ok) {
-    console.error(`probe: ${probe.detail}`)
+    // The probe is the profile-specific proof; verify alone can be made
+    // green by a heartbeat from an unrelated DSH session (~/.galvanize is
+    // shared). Never exit 0 on a failed probe.
+    console.error(`✖ probe failed: ${probe.detail}`)
+    return 1
   }
+  console.log(`  ✔ ${probe.detail}`)
   return cmdVerify(profile, dsh)
 }
 
